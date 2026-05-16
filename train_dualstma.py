@@ -17,7 +17,6 @@ Usage (ihatz A100):
 import os
 import sys
 import time
-import math
 import argparse
 import pickle
 import glob
@@ -87,25 +86,8 @@ class DualSTMADataset(Dataset):
     """
     Loads DualSTMA CSV and builds (obs, pred) sliding windows.
 
-    Each sample:
-      target_dynamic:      [obs_len, 8]  — 8 dynamic channels
-      target_static:       (type, length, width)
-      surrounding_dynamic: [M, obs_len, 8]
-      surrounding_static:  (type[M], length[M], width[M])
-      gt_pos:              [pred_len, 2] — absolute (lon, lat) in norm space
-      gt_vel:              [pred_len, 2] — velocity (dlon, dlat)
-      gt_heading:          [pred_len, 2] — (sin_h, cos_h)
-      last_obs_pos:        [2]           — last observed (lon, lat) norm
-
     Dynamic channels (Eq. 1):
       [lon, lat, dlon, dlat, v_lon, v_lat, θ_lon, θ_lat]
-    where:
-      dlon = lon_t - lon_{t-1}   (relative position)
-      dlat = lat_t - lat_{t-1}
-      v_lon = SOG * sin(Heading)  (velocity components)
-      v_lat = SOG * cos(Heading)
-      θ_lon = sin(Heading)        (heading components)
-      θ_lat = cos(Heading)
     """
 
     def __init__(self, data_dir, obs_len=10, pred_len=5, max_surr=10):
@@ -125,16 +107,13 @@ class DualSTMADataset(Dataset):
             print(f'  {os.path.basename(f)}: {df["vessel_id"].nunique()} vessels')
             dfs.append(df)
         self.df = pd.concat(dfs, ignore_index=True)
-
-        # Sort by frame_id then vessel_id
         self.df = self.df.sort_values(['frame_id', 'vessel_id']).reset_index(drop=True)
 
-        # Build samples
+        # Build index of (vessel_id, start_idx) for sliding windows
         self.samples = self._build_samples()
         print(f'  Total samples: {len(self.samples):,}')
 
     def _build_samples(self):
-        """Build sliding window samples per vessel."""
         samples = []
         vessel_groups = self.df.groupby('vessel_id')
 
@@ -146,111 +125,85 @@ class DualSTMADataset(Dataset):
 
             for start in range(n - self.seq_len + 1):
                 end = start + self.seq_len
-                window = group.iloc[start:end]
-
-                # Check temporal continuity (consecutive frame_ids)
-                frame_ids = window['frame_id'].values
+                frame_ids = group.iloc[start:end]['frame_id'].values
                 diffs = np.diff(frame_ids)
                 if not np.all(diffs == 1):
                     continue
-
-                samples.append({
-                    'vessel_id': vessel_id,
-                    'frame_start': frame_ids[0],
-                    'frame_end':   frame_ids[-1],
-                })
+                samples.append((vessel_id, start))
 
         return samples
 
-    def _get_dynamic_features(self, group_window):
+    def _get_dynamic_features(self, rows):
         """
-        Build 8-channel dynamic features from a window DataFrame.
+        Build 8-channel dynamic features from DataFrame rows.
         Channels: [lon, lat, dlon, dlat, v_lon, v_lat, θ_lon, θ_lat]
         """
-        lon     = group_window['LON'].values.astype(np.float32)
-        lat     = group_window['LAT'].values.astype(np.float32)
-        sog     = group_window['SOG'].values.astype(np.float32)
-        heading = group_window['Heading'].values.astype(np.float32)
+        lon     = rows['LON'].values.astype(np.float32)
+        lat     = rows['LAT'].values.astype(np.float32)
+        sog     = rows['SOG'].values.astype(np.float32)
+        heading = rows['Heading'].values.astype(np.float32)
 
-        # Relative position (dlon, dlat)
         dlon = np.zeros_like(lon)
         dlat = np.zeros_like(lat)
         dlon[1:] = lon[1:] - lon[:-1]
         dlat[1:] = lat[1:] - lat[:-1]
 
-        # Convert normalized heading to radians
-        # heading is normalized in [0,1] → multiply by 2π
         heading_rad = heading * 2 * np.pi
-
-        # Velocity components
-        v_lon = sog * np.sin(heading_rad)
-        v_lat = sog * np.cos(heading_rad)
-
-        # Heading components
+        v_lon     = sog * np.sin(heading_rad)
+        v_lat     = sog * np.cos(heading_rad)
         theta_lon = np.sin(heading_rad)
         theta_lat = np.cos(heading_rad)
 
-        features = np.stack([
-            lon, lat, dlon, dlat, v_lon, v_lat, theta_lon, theta_lat
-        ], axis=-1)  # [T, 8]
-
-        return features
+        return np.stack([lon, lat, dlon, dlat, v_lon, v_lat, theta_lon, theta_lat], axis=-1)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        vessel_id   = sample['vessel_id']
-        frame_start = sample['frame_start']
-        frame_end   = sample['frame_end']
+        vessel_id, start = self.samples[idx]
 
-        # Get target vessel window
-        vessel_group = self.df[self.df['vessel_id'] == vessel_id]
-        window = vessel_group[
-            (vessel_group['frame_id'] >= frame_start) &
-            (vessel_group['frame_id'] <= frame_end)
-        ].sort_values('frame_id')
+        # Get vessel rows
+        vessel_rows = self.df[self.df['vessel_id'] == vessel_id].sort_values('frame_id').reset_index(drop=True)
+        window = vessel_rows.iloc[start:start + self.seq_len]
 
-        # Dynamic features for full window
-        all_features = self._get_dynamic_features(window)  # [seq_len, 8]
-        obs_features  = all_features[:self.obs_len]         # [obs_len, 8]
-        pred_features = all_features[self.obs_len:]         # [pred_len, 8]
+        obs_rows  = window.iloc[:self.obs_len]
+        pred_rows = window.iloc[self.obs_len:self.obs_len + self.pred_len]
 
-        # Static features (constant per vessel)
-        v_type   = int(window['vessel_type'].iloc[0])
-        v_length = int(window['vessel_length'].iloc[0])
-        v_width  = int(window['vessel_width'].iloc[0])
+        # Verify pred_len
+        assert len(pred_rows) == self.pred_len, f"Expected {self.pred_len} pred rows, got {len(pred_rows)}"
 
-        # Ground truth for prediction
-        pred_window = window.iloc[self.obs_len:]
-        gt_lon = pred_window['LON'].values.astype(np.float32)
-        gt_lat = pred_window['LAT'].values.astype(np.float32)
-        gt_pos = np.stack([gt_lon, gt_lat], axis=-1)  # [pred_len, 2]
+        # Dynamic features
+        all_features  = self._get_dynamic_features(window)         # [seq_len, 8]
+        obs_features  = all_features[:self.obs_len]                 # [obs_len, 8]
 
-        gt_vel     = pred_features[:, 2:4]   # dlon, dlat
-        gt_heading = pred_features[:, 6:8]   # θ_lon, θ_lat
+        # Static features
+        v_type   = int(obs_rows['vessel_type'].iloc[0])
+        v_length = int(obs_rows['vessel_length'].iloc[0])
+        v_width  = int(obs_rows['vessel_width'].iloc[0])
 
-        # Last observed position
-        last_obs_pos = obs_features[-1, :2]  # [2] — lon, lat
+        # Ground truth
+        gt_lon = pred_rows['LON'].values.astype(np.float32)
+        gt_lat = pred_rows['LAT'].values.astype(np.float32)
+        gt_pos = np.stack([gt_lon, gt_lat], axis=-1)               # [pred_len, 2]
 
-        # --- Vessel-centered coordinate transform (Section 3.1.2) ---
-        # Translate: set last observed position as origin
+        pred_features = all_features[self.obs_len:self.obs_len + self.pred_len]
+        gt_vel        = pred_features[:, 2:4]                       # dlon, dlat
+        gt_heading    = pred_features[:, 6:8]                       # θ_lon, θ_lat
+
+        # Last observed position (for vessel-centered translation)
+        last_obs_pos = obs_features[-1, :2].copy()                  # [2]
+
+        # Vessel-centered: translate so last obs = origin
         obs_centered = obs_features.copy()
-        obs_centered[:, 0] -= last_obs_pos[0]  # lon - lon_last
-        obs_centered[:, 1] -= last_obs_pos[1]  # lat - lat_last
+        obs_centered[:, 0] -= last_obs_pos[0]
+        obs_centered[:, 1] -= last_obs_pos[1]
 
-        # Note: full rotation by heading omitted for simplicity
-        # (requires inverse transform at eval time)
-        # This is the translation component of vessel-centered coords
-
-        # --- Surrounding vessels ---
-        obs_frame_ids = window['frame_id'].values[:self.obs_len]
+        # Surrounding vessels
+        obs_frame_ids   = obs_rows['frame_id'].values
         frame_start_obs = obs_frame_ids[0]
         frame_end_obs   = obs_frame_ids[-1]
 
-        # Find vessels present in same time window
-        surr_df = self.df[
+        surr_df      = self.df[
             (self.df['vessel_id'] != vessel_id) &
             (self.df['frame_id'] >= frame_start_obs) &
             (self.df['frame_id'] <= frame_end_obs)
@@ -263,58 +216,43 @@ class DualSTMADataset(Dataset):
         surr_widths  = []
 
         for sv in surr_vessels[:self.max_surr]:
-            sv_group = surr_df[surr_df['vessel_id'] == sv].sort_values('frame_id')
-            if len(sv_group) < self.obs_len:
-                continue
-
-            sv_window = sv_group[
-                sv_group['frame_id'].isin(obs_frame_ids)
-            ].sort_values('frame_id')
-
+            sv_rows = surr_df[surr_df['vessel_id'] == sv].sort_values('frame_id')
+            sv_window = sv_rows[sv_rows['frame_id'].isin(obs_frame_ids)].sort_values('frame_id')
             if len(sv_window) != self.obs_len:
                 continue
-
-            sv_features = self._get_dynamic_features(sv_window)  # [obs_len, 8]
-
-            # Center surrounding vessel relative to target
-            sv_features[:, 0] -= last_obs_pos[0]
-            sv_features[:, 1] -= last_obs_pos[1]
-
-            surr_features_list.append(sv_features)
+            sv_feat = self._get_dynamic_features(sv_window)         # [obs_len, 8]
+            sv_feat[:, 0] -= last_obs_pos[0]
+            sv_feat[:, 1] -= last_obs_pos[1]
+            surr_features_list.append(sv_feat)
             surr_types.append(int(sv_window['vessel_type'].iloc[0]))
             surr_lengths.append(int(sv_window['vessel_length'].iloc[0]))
             surr_widths.append(int(sv_window['vessel_width'].iloc[0]))
 
-        # Pad surrounding vessels to max_surr
-        M = len(surr_features_list)
+        # Pad to max_surr
         surr_dynamic = np.zeros((self.max_surr, self.obs_len, 8), dtype=np.float32)
-        s_types   = np.zeros(self.max_surr, dtype=np.int64)
-        s_lengths = np.zeros(self.max_surr, dtype=np.int64)
-        s_widths  = np.zeros(self.max_surr, dtype=np.int64)
-        surr_mask = np.zeros(self.max_surr, dtype=bool)
+        s_types      = np.zeros(self.max_surr, dtype=np.int64)
+        s_lengths    = np.zeros(self.max_surr, dtype=np.int64)
+        s_widths     = np.zeros(self.max_surr, dtype=np.int64)
 
         for i, feat in enumerate(surr_features_list):
             surr_dynamic[i] = feat
             s_types[i]      = surr_types[i]
             s_lengths[i]    = surr_lengths[i]
             s_widths[i]     = surr_widths[i]
-            surr_mask[i]    = True
 
         return {
-            'obs_features':  torch.tensor(obs_centered, dtype=torch.float32),
-            'gt_pos':        torch.tensor(gt_pos,       dtype=torch.float32),
-            'gt_vel':        torch.tensor(gt_vel,       dtype=torch.float32),
-            'gt_heading':    torch.tensor(gt_heading,   dtype=torch.float32),
-            'last_obs_pos':  torch.tensor(last_obs_pos, dtype=torch.float32),
-            'v_type':        torch.tensor(v_type,       dtype=torch.long),
-            'v_length':      torch.tensor(v_length,     dtype=torch.long),
-            'v_width':       torch.tensor(v_width,      dtype=torch.long),
-            'surr_dynamic':  torch.tensor(surr_dynamic, dtype=torch.float32),
-            's_types':       torch.tensor(s_types,      dtype=torch.long),
-            's_lengths':     torch.tensor(s_lengths,    dtype=torch.long),
-            's_widths':      torch.tensor(s_widths,     dtype=torch.long),
-            'surr_mask':     torch.tensor(surr_mask,    dtype=torch.bool),
-            'num_surr':      torch.tensor(M,            dtype=torch.long),
+            'obs_features':  torch.tensor(obs_centered,  dtype=torch.float32),  # [obs_len, 8]
+            'gt_pos':        torch.tensor(gt_pos,         dtype=torch.float32),  # [pred_len, 2]
+            'gt_vel':        torch.tensor(gt_vel,         dtype=torch.float32),  # [pred_len, 2]
+            'gt_heading':    torch.tensor(gt_heading,     dtype=torch.float32),  # [pred_len, 2]
+            'last_obs_pos':  torch.tensor(last_obs_pos,   dtype=torch.float32),  # [2]
+            'v_type':        torch.tensor(v_type,         dtype=torch.long),
+            'v_length':      torch.tensor(v_length,       dtype=torch.long),
+            'v_width':       torch.tensor(v_width,        dtype=torch.long),
+            'surr_dynamic':  torch.tensor(surr_dynamic,   dtype=torch.float32),  # [max_surr, obs_len, 8]
+            's_types':       torch.tensor(s_types,        dtype=torch.long),
+            's_lengths':     torch.tensor(s_lengths,      dtype=torch.long),
+            's_widths':      torch.tensor(s_widths,       dtype=torch.long),
         }
 
 
@@ -335,20 +273,10 @@ def dualstma_loss(pred_pos, pred_vel, pred_heading,
     """
     DualSTMA loss (Section 3.4, Eq. 36-41):
       L = λ_pos * L_position + λ_heading * L_heading + λ_vel * L_velocity
-
-    pred_pos:     [N, pred_len, 2] — predicted absolute (lon, lat)
-    gt_pos:       [N, pred_len, 2] — ground truth absolute (lon, lat)
-    pred_vel:     [N, pred_len, 2]
-    gt_vel:       [N, pred_len, 2]
-    pred_heading: [N, pred_len, 2]
-    gt_heading:   [N, pred_len, 2]
-    last_obs_pos: [N, 2]
     """
     pred_len = pred_pos.shape[1]
 
-    # --- Position loss (Eq. 36) ---
-    # Short-term weighted: cumulative positions
-    # pred_pos is relative to last_obs — add back for absolute
+    # Position loss — short-term weighted (Eq. 36)
     abs_pred = pred_pos + last_obs_pos.unsqueeze(1)
     abs_gt   = gt_pos
 
@@ -363,11 +291,11 @@ def dualstma_loss(pred_pos, pred_vel, pred_heading,
         for t in range(pred_len)
     )
 
-    # --- Velocity loss (Eq. 40) ---
+    # Velocity loss (Eq. 40)
     vel_loss = F.huber_loss(pred_vel, gt_vel)
 
-    # --- Heading loss (Eq. 39) ---
-    h_error = wrapped_heading_error(pred_heading, gt_heading)
+    # Heading loss (Eq. 39)
+    h_error      = wrapped_heading_error(pred_heading, gt_heading)
     heading_loss = F.huber_loss(h_error, torch.zeros_like(h_error))
 
     total = lambda_pos * pos_loss + lambda_heading * heading_loss + lambda_vel * vel_loss
@@ -395,22 +323,22 @@ def run_epoch(model, loader, optimizer, scaler, checkpoint_dir, epoch, train=Tru
 
     with ctx:
         for batch in loader:
-            obs        = batch['obs_features'].to(device)   # [B, obs_len, 8]
-            gt_pos     = batch['gt_pos'].to(device)         # [B, pred_len, 2]
+            obs        = batch['obs_features'].to(device)
+            gt_pos     = batch['gt_pos'].to(device)
             gt_vel     = batch['gt_vel'].to(device)
             gt_heading = batch['gt_heading'].to(device)
-            last_obs   = batch['last_obs_pos'].to(device)   # [B, 2]
+            last_obs   = batch['last_obs_pos'].to(device)
 
             v_type   = batch['v_type'].to(device)
             v_length = batch['v_length'].to(device)
             v_width  = batch['v_width'].to(device)
 
-            surr_dyn  = batch['surr_dynamic'].to(device)   # [B, max_surr, obs_len, 8]
+            surr_dyn  = batch['surr_dynamic'].to(device)
             s_types   = batch['s_types'].to(device)
             s_lengths = batch['s_lengths'].to(device)
             s_widths  = batch['s_widths'].to(device)
 
-            target_static     = (v_type, v_length, v_width)
+            target_static      = (v_type, v_length, v_width)
             surrounding_static = (s_types, s_lengths, s_widths)
 
             with autocast():
@@ -487,22 +415,22 @@ def main():
 
     loader_train = DataLoader(
         dset_train, batch_size=args.batch_size,
-        shuffle=True, num_workers=4, pin_memory=True
+        shuffle=True, num_workers=0, pin_memory=True
     )
     loader_val = DataLoader(
         dset_val, batch_size=args.batch_size,
-        shuffle=False, num_workers=4, pin_memory=True
+        shuffle=False, num_workers=0, pin_memory=True
     )
 
     model = DualSTMA(
         d_model=32, hidden_dim=128, num_heads=8,
-    num_layers=4, dropout=0.1,
-    lstm_hidden=64, lstm_layers=2,
-    pred_len=args.pred_len,
-    num_vessel_types=101,  # max=100
-    num_lengths=32,        # max=31
-    num_widths=25,         # max=24
-    type_embed_dim=8
+        num_layers=4, dropout=0.1,
+        lstm_hidden=64, lstm_layers=2,
+        pred_len=args.pred_len,
+        num_vessel_types=101,
+        num_lengths=32,
+        num_widths=25,
+        type_embed_dim=8
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -516,7 +444,7 @@ def main():
 
     start_epoch = 0
     if args.resume:
-        last_ckpt = checkpoint_dir + 'last.pth'
+        last_ckpt       = checkpoint_dir + 'last.pth'
         last_epoch_file = checkpoint_dir + 'last_epoch.txt'
         if os.path.exists(last_ckpt):
             model.load_state_dict(torch.load(last_ckpt, map_location=device))
