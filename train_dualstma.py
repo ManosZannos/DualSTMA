@@ -496,10 +496,13 @@ def main():
 
     model = DualSTMA(
         d_model=32, hidden_dim=128, num_heads=8,
-        num_layers=4, dropout=0.1,
-        lstm_hidden=64, lstm_layers=2,
-        pred_len=args.pred_len,
-        num_vessel_types=50, type_embed_dim=8
+    num_layers=4, dropout=0.1,
+    lstm_hidden=64, lstm_layers=2,
+    pred_len=args.pred_len,
+    num_vessel_types=101,  # max=100
+    num_lengths=32,        # max=31
+    num_widths=25,         # max=24
+    type_embed_dim=8
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
