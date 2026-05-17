@@ -690,13 +690,17 @@ class DualSTMA(nn.Module):
         pos_vc, vel_vc, heading_vc = self.decoder(E) # all in vessel-centered space
 
         # --- FIX #3,#4,#5: Inverse transform (R_tn, P_tn) ---
+        # heading_rad: [N] → [N, pred_len] for broadcasting
+        head_expanded = heading_rad.unsqueeze(1).expand(-1, self.pred_len)  # [N, pred_len]
+        origin_expanded = last_obs_pos.unsqueeze(1).expand(-1, self.pred_len, -1)  # [N, pred_len, 2]
+
         # Position: inverse rotate + translate
-        pos = inverse_rotate_translate(pos_vc, heading_rad, last_obs_pos.unsqueeze(1).expand_as(pos_vc))
+        pos = inverse_rotate_translate(pos_vc, head_expanded, origin_expanded)
 
         # Velocity: inverse rotate only
-        vel = rotate_vector(vel_vc, heading_rad.unsqueeze(-1).unsqueeze(-1).expand_as(vel_vc[..., :1]).squeeze(-1))
+        vel = rotate_vector(vel_vc, head_expanded)
 
         # Heading: inverse rotate only
-        heading = rotate_vector(heading_vc, heading_rad.unsqueeze(-1).unsqueeze(-1).expand_as(heading_vc[..., :1]).squeeze(-1))
+        heading = rotate_vector(heading_vc, head_expanded)
 
         return pos, vel, heading
