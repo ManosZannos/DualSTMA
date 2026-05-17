@@ -221,9 +221,22 @@ class DualSTMADataset(Dataset):
         gt_lat = pred_rows['LAT'].values.astype(np.float32)
         gt_pos = np.stack([gt_lon, gt_lat], axis=-1)  # [pred_len, 2]
 
-        pred_features = all_features[self.obs_len:self.obs_len + self.pred_len]
-        gt_vel     = pred_features[:, 4:6]   # v_lon_r, v_lat_r (rotated)
-        gt_heading = pred_features[:, 6:8]   # θ_lon_r, θ_lat_r (rotated)
+        # gt_vel and gt_heading in ORIGINAL space (before rotation)
+        # Paper Section 3.3: inverse transform applied to all outputs
+        # so ground truth must also be in original space
+        pred_sog     = pred_rows['SOG'].values.astype(np.float32)
+        pred_heading_norm = pred_rows['Heading'].values.astype(np.float32)
+        pred_heading_rad  = pred_heading_norm * 2 * np.pi
+
+        # Original velocity components (no rotation)
+        v_lon_orig = pred_sog * np.sin(pred_heading_rad)
+        v_lat_orig = pred_sog * np.cos(pred_heading_rad)
+        gt_vel = np.stack([v_lon_orig, v_lat_orig], axis=-1)  # [pred_len, 2]
+
+        # Original heading components (no rotation)
+        theta_lon_orig = np.sin(pred_heading_rad)
+        theta_lat_orig = np.cos(pred_heading_rad)
+        gt_heading = np.stack([theta_lon_orig, theta_lat_orig], axis=-1)  # [pred_len, 2]
 
         # --- Surrounding vessels ---
         obs_frame_ids   = obs_rows['frame_id'].values
