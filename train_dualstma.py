@@ -6,6 +6,7 @@ Training script for DualSTMA v3 (Huang et al., JMSE 2024).
 v3 changes:
   - surr_mask: boolean mask for real vs padded surrounding vessels
   - Passed to model for key_padding_mask in spatial attention (Eq. 13, 18)
+  - Removed AMP (autocast/GradScaler) — paper uses float32 on RTX 3090Ti
 
 Usage (RTX 4090):
   python train_dualstma.py --dataset marinecadastre_2021 --obs_len 10 --pred_len 5
@@ -27,7 +28,6 @@ import torch
 import torch.nn as nn
 from torch import optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 from torch.nn import functional as F
 import pandas as pd
 
@@ -57,7 +57,7 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 args = parser.parse_args()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-print('Training DualSTMA v3 ...')
+print('Training DualSTMA v3 (float32, no AMP) ...')
 print(args)
 
 
@@ -239,12 +239,10 @@ class DualSTMADataset(Dataset):
 
         n_real = len(surr_features_list)
 
-        # Pad to max_surr
         surr_dynamic = np.zeros((self.max_surr, self.obs_len, 8), dtype=np.float32)
         s_types      = np.zeros(self.max_surr, dtype=np.int64)
         s_widths     = np.zeros(self.max_surr, dtype=np.int64)
         s_lengths    = np.zeros(self.max_surr, dtype=np.int64)
-        # FIX #12: surr_mask — True=real, False=padded
         surr_mask    = np.zeros(self.max_surr, dtype=bool)
 
         for i, feat in enumerate(surr_features_list):
@@ -252,7 +250,7 @@ class DualSTMADataset(Dataset):
             s_types[i]      = surr_types[i]
             s_widths[i]     = surr_widths[i]
             s_lengths[i]    = surr_lengths[i]
-            surr_mask[i]    = True  # real vessel
+            surr_mask[i]    = True
 
         return {
             'obs_features':  torch.tensor(obs_features,  dtype=torch.float32),
@@ -268,7 +266,7 @@ class DualSTMADataset(Dataset):
             's_types':       torch.tensor(s_types,   dtype=torch.long),
             's_widths':      torch.tensor(s_widths,  dtype=torch.long),
             's_lengths':     torch.tensor(s_lengths, dtype=torch.long),
-            'surr_mask':     torch.tensor(surr_mask, dtype=torch.bool),  # FIX #12
+            'surr_mask':     torch.tensor(surr_mask, dtype=torch.bool),
         }
 
 
@@ -317,7 +315,7 @@ constant_metrics = {
 }
 
 
-def run_epoch(model, loader, optimizer, scaler, checkpoint_dir, epoch, train=True):
+def run_epoch(model, loader, optimizer, checkpoint_dir, epoch, train=True):
     global metrics, constant_metrics
     model.train() if train else model.eval()
 
@@ -342,31 +340,35 @@ def run_epoch(model, loader, optimizer, scaler, checkpoint_dir, epoch, train=Tru
             s_types   = batch['s_types'].to(device)
             s_widths  = batch['s_widths'].to(device)
             s_lengths = batch['s_lengths'].to(device)
-            # FIX #12: surr_mask
             surr_mask = batch['surr_mask'].to(device)
 
             target_static      = (v_type, v_width, v_length)
             surrounding_static = (s_types, s_widths, s_lengths)
 
-            with autocast():
-                pred_pos, pred_vel, pred_heading = model(
-                    obs, target_static,
-                    head_rad, last_obs,
-                    surr_dyn, surrounding_static,
-                    surr_mask=surr_mask  # FIX #12
-                )
+            # Forward pass — float32, no AMP
+            pred_pos, pred_vel, pred_heading = model(
+                obs, target_static,
+                head_rad, last_obs,
+                surr_dyn, surrounding_static,
+                surr_mask=surr_mask
+            )
 
-                loss, pos_l, vel_l, head_l = dualstma_loss(
-                    pred_pos, pred_vel, pred_heading,
-                    gt_pos, gt_vel, gt_heading
-                )
+            loss, pos_l, vel_l, head_l = dualstma_loss(
+                pred_pos, pred_vel, pred_heading,
+                gt_pos, gt_vel, gt_heading
+            )
 
             if train:
                 optimizer.zero_grad()
-                scaler.scale(loss).backward()
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
+
+            # Check for NaN
+            if torch.isnan(loss):
+                print(f'  WARNING: NaN loss at batch {n_batches}!')
+                print(f'    pos_l={pos_l.item():.6f} vel_l={vel_l.item():.6f} head_l={head_l.item():.6f}')
+                continue
 
             total_loss += loss.item()
             n_batches  += 1
@@ -446,7 +448,6 @@ def main():
     print(f'Model parameters: {n_params:,}')
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
-    scaler    = GradScaler()
 
     checkpoint_dir = f'./checkpoints/{args.tag}/{args.dataset}/'
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -468,10 +469,8 @@ def main():
     print(f'Train: {len(dset_train):,} | Val: {len(dset_val):,}')
 
     for epoch in range(start_epoch, args.num_epochs):
-        run_epoch(model, loader_train, optimizer, scaler,
-                  checkpoint_dir, epoch, train=True)
-        run_epoch(model, loader_val, optimizer, scaler,
-                  checkpoint_dir, epoch, train=False)
+        run_epoch(model, loader_train, optimizer, checkpoint_dir, epoch, train=True)
+        run_epoch(model, loader_val,   optimizer, checkpoint_dir, epoch, train=False)
 
         print('*' * 40)
         print(f'Epoch {epoch}/{args.num_epochs}')
