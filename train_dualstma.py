@@ -426,11 +426,11 @@ def main():
 
     loader_train = DataLoader(
         dset_train, batch_size=args.batch_size,
-        shuffle=True, num_workers=4, pin_memory=True
+        shuffle=True, num_workers=0, pin_memory=True
     )
     loader_val = DataLoader(
         dset_val, batch_size=args.batch_size,
-        shuffle=False, num_workers=4, pin_memory=True
+        shuffle=False, num_workers=0, pin_memory=True
     )
 
     model = DualSTMA(
