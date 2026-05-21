@@ -186,11 +186,23 @@ class TransformerLayer(nn.Module):
         x:               [B, T, d_model]
         context:         [B, S, d_model] — for cross-attention
         key_padding_mask:[B, S] bool — True = ignore (padded vessel)
+
+        FIX: When all keys are masked (all True), softmax(-inf,...) = NaN.
+        In this case we skip attention and use residual only.
         """
         if self.cross_attention and context is not None:
+            # FIX: if all surrounding vessels are padded for a sample,
+            # set that sample's mask to all False to avoid NaN in softmax
+            safe_mask = key_padding_mask
+            if key_padding_mask is not None:
+                all_masked = key_padding_mask.all(dim=-1, keepdim=True)  # [B, 1]
+                if all_masked.any():
+                    # For samples with all masked, unmask all to avoid NaN
+                    safe_mask = key_padding_mask.clone()
+                    safe_mask[all_masked.squeeze(-1)] = False
             x2, _ = self.attn(
                 self.norm1(x), context, context,
-                key_padding_mask=key_padding_mask
+                key_padding_mask=safe_mask
             )
         else:
             x2, _ = self.attn(
