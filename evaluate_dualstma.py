@@ -73,7 +73,8 @@ def denormalize(lon_norm, lat_norm, lon_min, lon_range, lat_min, lat_range):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, loader, lon_min, lon_range, lat_min, lat_range):
+def evaluate(model, loader):
+    """Predictions and gt_pos are in degrees (LON_abs/LAT_abs) — no denormalization needed."""
     model.eval()
 
     all_pred_lon = []
@@ -96,7 +97,7 @@ def evaluate(model, loader, lon_min, lon_range, lat_min, lat_range):
             s_types   = batch['s_types'].to(device)
             s_widths  = batch['s_widths'].to(device)
             s_lengths = batch['s_lengths'].to(device)
-            surr_mask = batch['surr_mask'].to(device)  # FIX #12
+            surr_mask = batch['surr_mask'].to(device)
 
             target_static      = (v_type, v_width, v_length)
             surrounding_static = (s_types, s_widths, s_lengths)
@@ -108,20 +109,11 @@ def evaluate(model, loader, lon_min, lon_range, lat_min, lat_range):
                 surr_mask=surr_mask
             )
 
-            # Denormalize
-            pred_lon_norm = pred_pos[:, :, 0].cpu().numpy()
-            pred_lat_norm = pred_pos[:, :, 1].cpu().numpy()
-            pred_lon, pred_lat = denormalize(
-                pred_lon_norm, pred_lat_norm,
-                lon_min, lon_range, lat_min, lat_range
-            )
-
-            gt_lon_norm = gt_pos[:, :, 0].cpu().numpy()
-            gt_lat_norm = gt_pos[:, :, 1].cpu().numpy()
-            gt_lon, gt_lat = denormalize(
-                gt_lon_norm, gt_lat_norm,
-                lon_min, lon_range, lat_min, lat_range
-            )
+            # Already in degrees (LON_abs/LAT_abs)
+            pred_lon = pred_pos[:, :, 0].cpu().numpy()
+            pred_lat = pred_pos[:, :, 1].cpu().numpy()
+            gt_lon   = gt_pos[:, :, 0].cpu().numpy()
+            gt_lat   = gt_pos[:, :, 1].cpu().numpy()
 
             all_pred_lon.append(pred_lon)
             all_pred_lat.append(pred_lat)
@@ -158,9 +150,7 @@ def evaluate(model, loader, lon_min, lon_range, lat_min, lat_range):
 def main():
     data_set = os.path.join('./dataset', args.dataset)
 
-    lon_min, lon_range, lat_min, lat_range = load_global_stats(args.dataset)
-    print(f'LON: [{lon_min:.5f}, {lon_min+lon_range:.5f}]')
-    print(f'LAT: [{lat_min:.5f}, {lat_min+lat_range:.5f}]')
+    print('Using LON_abs/LAT_abs (degrees) — no denormalization needed')
 
     split_dir = os.path.join(data_set, f'dualstma_{args.split}')
     dset = DualSTMADataset(
@@ -187,9 +177,7 @@ def main():
     model.load_state_dict(checkpoint)
     print(f'Loaded: {args.checkpoint}')
 
-    rmse, mae, ade, fde, ade_per_step, N = evaluate(
-        model, loader, lon_min, lon_range, lat_min, lat_range
-    )
+    rmse, mae, ade, fde, ade_per_step, N = evaluate(model, loader)
 
     horizons = [(t+1)*10 for t in range(args.pred_len)]
 

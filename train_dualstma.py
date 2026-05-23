@@ -130,9 +130,12 @@ class DualSTMADataset(Dataset):
         return lon_r, lat_r
 
     def _get_dynamic_features(self, rows, heading_rad_tn, origin_lon, origin_lat):
-        """8-channel dynamic features after vessel-centered rotation."""
-        lon     = rows['LON'].values.astype(np.float32)
-        lat     = rows['LAT'].values.astype(np.float32)
+        """8-channel dynamic features after vessel-centered rotation.
+        Uses LON_abs/LAT_abs (degrees) — matching paper's raw coordinate system.
+        SOG and Heading remain normalized [0,1].
+        """
+        lon     = rows['LON_abs'].values.astype(np.float32)
+        lat     = rows['LAT_abs'].values.astype(np.float32)
         sog     = rows['SOG'].values.astype(np.float32)
         heading = rows['Heading'].values.astype(np.float32)
 
@@ -177,8 +180,8 @@ class DualSTMADataset(Dataset):
 
         assert len(pred_rows) == self.pred_len
 
-        origin_lon     = float(obs_rows['LON'].iloc[-1])
-        origin_lat     = float(obs_rows['LAT'].iloc[-1])
+        origin_lon     = float(obs_rows['LON_abs'].iloc[-1])
+        origin_lat     = float(obs_rows['LAT_abs'].iloc[-1])
         heading_norm   = float(obs_rows['Heading'].iloc[-1])
         heading_rad_tn = heading_norm * 2 * np.pi
 
@@ -191,8 +194,8 @@ class DualSTMADataset(Dataset):
         v_width  = int(obs_rows['vessel_width'].iloc[0])
         v_length = int(obs_rows['vessel_length'].iloc[0])
 
-        gt_lon = pred_rows['LON'].values.astype(np.float32)
-        gt_lat = pred_rows['LAT'].values.astype(np.float32)
+        gt_lon = pred_rows['LON_abs'].values.astype(np.float32)
+        gt_lat = pred_rows['LAT_abs'].values.astype(np.float32)
         gt_pos = np.stack([gt_lon, gt_lat], axis=-1)
 
         pred_sog          = pred_rows['SOG'].values.astype(np.float32)
