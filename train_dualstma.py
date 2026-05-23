@@ -29,6 +29,7 @@ import torch.nn as nn
 from torch import optim
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import functional as F
+import json
 import pandas as pd
 
 from model_dualstma import DualSTMA, rotate_translate
@@ -94,6 +95,16 @@ class DualSTMADataset(Dataset):
         self.max_surr = max_surr
         self.seq_len  = obs_len + pred_len
 
+        # Load global_stats for denormalization LON/LAT norm → degrees
+        stats_path = os.path.join(os.path.dirname(os.path.dirname(data_dir)),
+                                  'global_stats.json')
+        with open(stats_path) as f:
+            stats = json.load(f)
+        self.lon_mean  = stats['LON']['mean']
+        self.lon_std   = stats['LON']['std']
+        self.lat_mean  = stats['LAT']['mean']
+        self.lat_std   = stats['LAT']['std']
+
         csv_files = sorted(glob.glob(os.path.join(data_dir, '*.csv')))
         if not csv_files:
             raise RuntimeError(f'No CSV files found in {data_dir}')
@@ -131,11 +142,11 @@ class DualSTMADataset(Dataset):
 
     def _get_dynamic_features(self, rows, heading_rad_tn, origin_lon, origin_lat):
         """8-channel dynamic features after vessel-centered rotation.
-        Uses LON_abs/LAT_abs (degrees) — matching paper's raw coordinate system.
+        Denormalizes LON/LAT to degrees using global_stats.json.
         SOG and Heading remain normalized [0,1].
         """
-        lon     = rows['LON_abs'].values.astype(np.float32)
-        lat     = rows['LAT_abs'].values.astype(np.float32)
+        lon     = rows['LON'].values.astype(np.float32) * self.lon_std + self.lon_mean
+        lat     = rows['LAT'].values.astype(np.float32) * self.lat_std + self.lat_mean
         sog     = rows['SOG'].values.astype(np.float32)
         heading = rows['Heading'].values.astype(np.float32)
 
@@ -180,8 +191,8 @@ class DualSTMADataset(Dataset):
 
         assert len(pred_rows) == self.pred_len
 
-        origin_lon     = float(obs_rows['LON_abs'].iloc[-1])
-        origin_lat     = float(obs_rows['LAT_abs'].iloc[-1])
+        origin_lon     = float(obs_rows['LON'].iloc[-1]) * self.lon_std + self.lon_mean
+        origin_lat     = float(obs_rows['LAT'].iloc[-1]) * self.lat_std + self.lat_mean
         heading_norm   = float(obs_rows['Heading'].iloc[-1])
         heading_rad_tn = heading_norm * 2 * np.pi
 
@@ -194,8 +205,8 @@ class DualSTMADataset(Dataset):
         v_width  = int(obs_rows['vessel_width'].iloc[0])
         v_length = int(obs_rows['vessel_length'].iloc[0])
 
-        gt_lon = pred_rows['LON_abs'].values.astype(np.float32)
-        gt_lat = pred_rows['LAT_abs'].values.astype(np.float32)
+        gt_lon = pred_rows['LON'].values.astype(np.float32) * self.lon_std + self.lon_mean
+        gt_lat = pred_rows['LAT'].values.astype(np.float32) * self.lat_std + self.lat_mean
         gt_pos = np.stack([gt_lon, gt_lat], axis=-1)
 
         pred_sog          = pred_rows['SOG'].values.astype(np.float32)
