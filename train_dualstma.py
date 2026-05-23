@@ -96,8 +96,7 @@ class DualSTMADataset(Dataset):
         self.seq_len  = obs_len + pred_len
 
         # Load global_stats for denormalization LON/LAT norm → degrees
-        stats_path = os.path.join(os.path.dirname(os.path.dirname(data_dir)),
-                                  'global_stats.json')
+        stats_path = os.path.join(os.path.dirname(data_dir), 'global_stats.json')
         with open(stats_path) as f:
             stats = json.load(f)
         self.lon_mean  = stats['LON']['mean']
