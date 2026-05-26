@@ -73,8 +73,8 @@ def denormalize(lon_norm, lat_norm, lon_min, lon_range, lat_min, lat_range):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(model, loader):
-    """Predictions and gt_pos are in degrees (LON_abs/LAT_abs) — no denormalization needed."""
+def evaluate(model, loader, lon_min, lon_range, lat_min, lat_range):
+    """Predictions and gt_pos in normalized [0,1] space — denormalize for ADE in degrees."""
     model.eval()
 
     all_pred_lon = []
@@ -109,11 +109,11 @@ def evaluate(model, loader):
                 surr_mask=surr_mask
             )
 
-            # Already in degrees (LON_abs/LAT_abs)
-            pred_lon = pred_pos[:, :, 0].cpu().numpy()
-            pred_lat = pred_pos[:, :, 1].cpu().numpy()
-            gt_lon   = gt_pos[:, :, 0].cpu().numpy()
-            gt_lat   = gt_pos[:, :, 1].cpu().numpy()
+            # Denormalize from [0,1] to degrees
+            pred_lon = pred_pos[:, :, 0].cpu().numpy() * lon_range + lon_min
+            pred_lat = pred_pos[:, :, 1].cpu().numpy() * lat_range + lat_min
+            gt_lon   = gt_pos[:, :, 0].cpu().numpy() * lon_range + lon_min
+            gt_lat   = gt_pos[:, :, 1].cpu().numpy() * lat_range + lat_min
 
             all_pred_lon.append(pred_lon)
             all_pred_lat.append(pred_lat)
@@ -150,7 +150,9 @@ def evaluate(model, loader):
 def main():
     data_set = os.path.join('./dataset', args.dataset)
 
-    print('Using LON_abs/LAT_abs (degrees) — no denormalization needed')
+    lon_min, lon_range, lat_min, lat_range = load_global_stats(args.dataset)
+    print(f'LON: [{lon_min:.5f}, {lon_min+lon_range:.5f}]')
+    print(f'LAT: [{lat_min:.5f}, {lat_min+lat_range:.5f}]')
 
     split_dir = os.path.join(data_set, f'dualstma_{args.split}')
     dset = DualSTMADataset(
@@ -177,12 +179,14 @@ def main():
     model.load_state_dict(checkpoint)
     print(f'Loaded: {args.checkpoint}')
 
-    rmse, mae, ade, fde, ade_per_step, N = evaluate(model, loader)
+    rmse, mae, ade, fde, ade_per_step, N = evaluate(
+        model, loader, lon_min, lon_range, lat_min, lat_range
+    )
 
     horizons = [(t+1)*10 for t in range(args.pred_len)]
 
     print('\n' + '='*70)
-    print('EVALUATION RESULTS — DualSTMA v3')
+    print('EVALUATION RESULTS — DualSTMA v4')
     print('='*70)
     print(f'Dataset:   {args.dataset} ({args.split})')
     print(f'Sequences: {N:,}')
