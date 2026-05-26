@@ -187,8 +187,8 @@ class TransformerLayer(nn.Module):
         context:         [B, S, d_model] — for cross-attention
         key_padding_mask:[B, S] bool — True = ignore (padded vessel)
 
-        FIX: When all keys are masked (all True), softmax(-inf,...) = NaN.
-        In this case we skip attention and use residual only.
+        POST-NORM (paper: "apply layer normalization after each attention module"):
+          x → attention → Add → Norm → MLP → Add → Norm → FFN → Add → Norm
         """
         if self.cross_attention and context is not None:
             # FIX: if all surrounding vessels are padded for a sample,
@@ -197,21 +197,23 @@ class TransformerLayer(nn.Module):
             if key_padding_mask is not None:
                 all_masked = key_padding_mask.all(dim=-1, keepdim=True)  # [B, 1]
                 if all_masked.any():
-                    # For samples with all masked, unmask all to avoid NaN
                     safe_mask = key_padding_mask.clone()
                     safe_mask[all_masked.squeeze(-1)] = False
             x2, _ = self.attn(
-                self.norm1(x), context, context,
+                x, context, context,
                 key_padding_mask=safe_mask
             )
         else:
             x2, _ = self.attn(
-                self.norm1(x), self.norm1(x), self.norm1(x),
+                x, x, x,
                 key_padding_mask=key_padding_mask
             )
-        x = x + self.dropout(x2)
-        x = x + self.dropout(self.post_attn_mlp(self.norm3(x)))
-        x = x + self.dropout(self.ffn(self.norm2(x)))
+        # Post-norm: Add & Norm after attention
+        x = self.norm1(x + self.dropout(x2))
+        # Post-norm: Add & Norm after MLP
+        x = self.norm3(x + self.dropout(self.post_attn_mlp(x)))
+        # Post-norm: Add & Norm after FFN
+        x = self.norm2(x + self.dropout(self.ffn(x)))
         return x
 
 
