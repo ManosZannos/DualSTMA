@@ -5,19 +5,21 @@ DualSTMA: Dual Spatial-Temporal Multi-head Attention
 Huang et al., Journal of Marine Science and Engineering, 2024
 DOI: 10.3390/jmse12112031
 
-Fixes from checklist:
- 1. Rotation R_tn by heading θi_tn for target + surrounding vessels
- 2. Velocity/heading components computed AFTER rotation
- 3. Inverse position (R_tn + P_tn) applied to output
- 4. Inverse heading (R_tn) applied to output
- 5. Inverse velocity (R_tn) applied to output
- 6. MLP order: (type_emb, width, length)
- 7. TS path: concat(hd_i, type_emb) + gating for EVERY vessel
- 8. TS path: surrounding vessels use same concat+gating for K,V
- 9. MLP after each attention module
-10. ST path: surrounding vessels use same concat+gating for K,V
-11. Heading loss with floormod instead of atan2
-12. [v3] Padding mask for surrounding vessels in spatial attention (Eq. 13, 18)
+SIMPLIFICATION (Επιλογή Α):
+- DynamicFeatureEncoder: in_channels=4 (LON, LAT, SOG, Heading) αντί 8
+- Αφαίρεση vessel-centered inverse transform από forward()
+- Το μοντέλο προβλέπει απευθείας absolute normalized positions [0,1]
+- Αφαίρεση rotate_translate / inverse_rotate_translate από forward
+  (διατηρούνται ως utility functions για πιθανή μελλοντική χρήση)
+
+Fixes που διατηρούνται:
+ 1. POST-NORM TransformerLayer
+ 2. Padding mask για surrounding vessels (surr_mask)
+ 3. Safe mask όταν όλα τα surrounding vessels είναι padded (NaN fix)
+ 4. MLP after each attention module
+ 5. Learnable aggregation token
+ 6. Sinusoidal positional encoding
+ 7. Static feature gating (type/width/length)
 """
 
 import math
@@ -27,16 +29,10 @@ from torch.nn import functional as F
 
 
 # ---------------------------------------------------------------------------
-# Vessel-Centered Coordinate Transform (Section 3.1.2)
+# Vessel-Centered Coordinate Transform (διατηρείται για μελλοντική χρήση)
 # ---------------------------------------------------------------------------
 
 def rotate_translate(coords, heading_rad, origin):
-    """
-    Apply vessel-centered transform.
-    coords:      [..., 2]
-    heading_rad: [...] or scalar
-    origin:      [..., 2]
-    """
     translated = coords - origin
     cos_h = torch.cos(heading_rad)
     sin_h = torch.sin(heading_rad)
@@ -48,12 +44,6 @@ def rotate_translate(coords, heading_rad, origin):
 
 
 def inverse_rotate_translate(coords, heading_rad, origin):
-    """
-    Inverse vessel-centered transform.
-    coords:      [..., 2]
-    heading_rad: [...] or scalar
-    origin:      [..., 2]
-    """
     cos_h = torch.cos(heading_rad)
     sin_h = torch.sin(heading_rad)
     lon_r = coords[..., 0]
@@ -64,7 +54,6 @@ def inverse_rotate_translate(coords, heading_rad, origin):
 
 
 def rotate_vector(vec, heading_rad):
-    """Rotate a 2D vector by heading_rad. vec: [..., 2]"""
     cos_h = torch.cos(heading_rad)
     sin_h = torch.sin(heading_rad)
     vx = vec[..., 0]
@@ -104,9 +93,13 @@ class SinusoidalPositionalEncoding(nn.Module):
 class DynamicFeatureEncoder(nn.Module):
     """
     Conv2d(1x1) + affine (γ,β) + ReLU (Eq. 1-3)
-    Input: [N, T, 8] → Output: [N, T, d_model]
+
+    ΑΛΛΑΓΗ: in_channels=4 (LON, LAT, SOG, Heading) αντί 8
+    Δεν υπάρχει πλέον vessel-centered transform — απευθείας normalized [0,1] features.
+
+    Input:  [N, T, 4] → Output: [N, T, d_model]
     """
-    def __init__(self, in_channels=8, d_model=32):
+    def __init__(self, in_channels=4, d_model=32):
         super().__init__()
         self.conv  = nn.Conv2d(in_channels, d_model, kernel_size=1)
         self.gamma = nn.Parameter(torch.ones(d_model))
@@ -114,9 +107,10 @@ class DynamicFeatureEncoder(nn.Module):
         self.relu  = nn.ReLU()
 
     def forward(self, x):
-        x = x.permute(0, 2, 1).unsqueeze(-1)
-        x = self.conv(x)
-        x = x.squeeze(-1).permute(0, 2, 1)
+        # x: [N, T, in_channels]
+        x = x.permute(0, 2, 1).unsqueeze(-1)   # [N, in_channels, T, 1]
+        x = self.conv(x)                         # [N, d_model, T, 1]
+        x = x.squeeze(-1).permute(0, 2, 1)       # [N, T, d_model]
         x = x * self.gamma + self.beta
         x = self.relu(x)
         return x
@@ -125,7 +119,6 @@ class DynamicFeatureEncoder(nn.Module):
 class StaticFeatureEncoder(nn.Module):
     """
     MLP(type_embedding, width, length) + Sigmoid (Eq. 4-5)
-    FIX #6: order is (type_emb, width, length)
     """
     def __init__(self, num_vessel_types=101, num_lengths=32, num_widths=25,
                  type_embed_dim=8, d_model=32):
@@ -155,8 +148,7 @@ class StaticFeatureEncoder(nn.Module):
 
 class TransformerLayer(nn.Module):
     """
-    Multi-Head Attention + Add&Norm + MLP + FFN + Add&Norm
-    FIX #9: MLP after attention module
+    POST-NORM: attention → Add&Norm → MLP → Add&Norm → FFN → Add&Norm
     """
     def __init__(self, d_model=128, num_heads=8, dropout=0.1, cross_attention=False):
         super().__init__()
@@ -164,7 +156,7 @@ class TransformerLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(
+        self.attn  = nn.MultiheadAttention(
             d_model, num_heads, dropout=dropout, batch_first=True
         )
         self.ffn = nn.Sequential(
@@ -182,37 +174,20 @@ class TransformerLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, context=None, key_padding_mask=None):
-        """
-        x:               [B, T, d_model]
-        context:         [B, S, d_model] — for cross-attention
-        key_padding_mask:[B, S] bool — True = ignore (padded vessel)
-
-        POST-NORM (paper: "apply layer normalization after each attention module"):
-          x → attention → Add → Norm → MLP → Add → Norm → FFN → Add → Norm
-        """
         if self.cross_attention and context is not None:
-            # FIX: if all surrounding vessels are padded for a sample,
-            # set that sample's mask to all False to avoid NaN in softmax
+            # Safe mask: αποφυγή NaN όταν όλα τα surrounding vessels είναι padded
             safe_mask = key_padding_mask
             if key_padding_mask is not None:
-                all_masked = key_padding_mask.all(dim=-1, keepdim=True)  # [B, 1]
+                all_masked = key_padding_mask.all(dim=-1, keepdim=True)
                 if all_masked.any():
                     safe_mask = key_padding_mask.clone()
                     safe_mask[all_masked.squeeze(-1)] = False
-            x2, _ = self.attn(
-                x, context, context,
-                key_padding_mask=safe_mask
-            )
+            x2, _ = self.attn(x, context, context, key_padding_mask=safe_mask)
         else:
-            x2, _ = self.attn(
-                x, x, x,
-                key_padding_mask=key_padding_mask
-            )
-        # Post-norm: Add & Norm after attention
+            x2, _ = self.attn(x, x, x, key_padding_mask=key_padding_mask)
+
         x = self.norm1(x + self.dropout(x2))
-        # Post-norm: Add & Norm after MLP
         x = self.norm3(x + self.dropout(self.post_attn_mlp(x)))
-        # Post-norm: Add & Norm after FFN
         x = self.norm2(x + self.dropout(self.ffn(x)))
         return x
 
@@ -222,10 +197,6 @@ class TransformerLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 def fuse_vessel_features(hd, type_emb, zs_gate, proj_layer):
-    """
-    FIX #7,#8,#10: concat(hd, type_emb) → project → gate
-    Eq. 10-11 (TS) and Eq. 15-16 (ST)
-    """
     h_hat = torch.cat([hd, type_emb], dim=-1)
     h_hat = proj_layer(h_hat)
     h     = h_hat * zs_gate
@@ -237,11 +208,6 @@ def fuse_vessel_features(hd, type_emb, zs_gate, proj_layer):
 # ---------------------------------------------------------------------------
 
 class TemporalSpatialPath(nn.Module):
-    """
-    Temporal-Spatial Path (Section 3.2.1, Eq. 6-14)
-    FIX #12: padding mask for spatial cross-attention
-    """
-
     def __init__(self, d_model=128, num_heads=8, num_layers=4,
                  dropout=0.1, type_embed_dim=8):
         super().__init__()
@@ -271,20 +237,14 @@ class TemporalSpatialPath(nn.Module):
     def forward(self, zd, zs_gate, type_emb,
                 surrounding_zd, surrounding_zs_gate, surrounding_type_emb,
                 surr_mask=None):
-        """
-        surr_mask: [N, M] bool — True = real vessel, False = padded
-        FIX #12: convert to key_padding_mask (True = ignore)
-        """
         N = zd.shape[0]
 
-        # Target vessel: temporal encode + fuse (Eq. 6-11)
         hd_i = self._encode_temporal(zd)
         hi   = fuse_vessel_features(hd_i, type_emb, zs_gate, self.fuse_proj)
 
         M = surrounding_zd.shape[1] if surrounding_zd is not None else 0
 
         if M > 0:
-            # Surrounding vessels: temporal encode + fuse
             surr_summaries = []
             for m in range(M):
                 surr_zd_m   = surrounding_zd[:, m, :, :]
@@ -296,12 +256,10 @@ class TemporalSpatialPath(nn.Module):
 
             surr_context = torch.cat(surr_summaries, dim=1)  # [N, M, d_model]
 
-            # FIX #12: padding mask — True = padded (ignore)
             key_padding_mask = None
             if surr_mask is not None:
-                key_padding_mask = ~surr_mask  # [N, M] True=ignore
+                key_padding_mask = ~surr_mask  # True = ignore (padded)
 
-            # Spatial cross-attention (Eq. 12-14)
             query = hi.unsqueeze(1)
             for layer in self.spatial_layers:
                 query = layer(query, context=surr_context,
@@ -318,11 +276,6 @@ class TemporalSpatialPath(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SpatialTemporalPath(nn.Module):
-    """
-    Spatial-Temporal Path (Section 3.2.2, Eq. 15-23)
-    FIX #12: padding mask for spatial cross-attention
-    """
-
     def __init__(self, d_model=128, num_heads=8, num_layers=4,
                  dropout=0.1, type_embed_dim=8):
         super().__init__()
@@ -342,19 +295,13 @@ class SpatialTemporalPath(nn.Module):
     def forward(self, zd, zs_gate, type_emb,
                 surrounding_zd, surrounding_zs_gate, surrounding_type_emb,
                 surr_mask=None):
-        """
-        surr_mask: [N, M] bool — True = real vessel, False = padded
-        FIX #12: padding mask per time step
-        """
         N, T, D = zd.shape
         M = surrounding_zd.shape[1] if surrounding_zd is not None else 0
 
-        # FIX #12: key_padding_mask
         key_padding_mask = None
         if surr_mask is not None and M > 0:
-            key_padding_mask = ~surr_mask  # [N, M] True=ignore
+            key_padding_mask = ~surr_mask  # True = ignore (padded)
 
-        # Step 1: Spatial cross-attention at each time step (Eq. 15-19)
         if M > 0:
             spatial_outputs = []
             for t in range(T):
@@ -370,7 +317,7 @@ class SpatialTemporalPath(nn.Module):
                     zt_j   = fuse_vessel_features(zd_j_t, temb_j, gate_j, self.fuse_proj)
                     surr_t_list.append(zt_j.unsqueeze(1))
 
-                surr_t_context = torch.cat(surr_t_list, dim=1)  # [N, M, d_model]
+                surr_t_context = torch.cat(surr_t_list, dim=1)
 
                 st_t = zt_query
                 for layer in self.spatial_layers:
@@ -387,7 +334,6 @@ class SpatialTemporalPath(nn.Module):
                 self.fuse_proj
             ).view(N, T, D)
 
-        # Step 2: Temporal self-attention (Eq. 20-23)
         agg   = self.agg_token.expand(N, -1, -1)
         s_hat = torch.cat([s, agg], dim=1)
         s_hat = self.pos_enc(s_hat)
@@ -403,8 +349,10 @@ class SpatialTemporalPath(nn.Module):
 # ---------------------------------------------------------------------------
 
 class LSTMDecoder(nn.Module):
-    """LSTM Decoder (Section 3.3, Eq. 24-33)."""
-
+    """
+    LSTM Decoder — προβλέπει μόνο position (2D).
+    ΑΛΛΑΓΗ: αφαίρεση mlp_vel και mlp_heading (δεν χρειάζονται χωρίς vessel-centered).
+    """
     def __init__(self, input_dim, hidden_dim=64, num_layers=2,
                  pred_len=5, dropout=0.1):
         super().__init__()
@@ -421,23 +369,13 @@ class LSTMDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, 2)
         )
-        self.mlp_vel = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, 2)
-        )
-        self.mlp_heading = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, 2)
-        )
 
     def forward(self, E):
         e = self.input_proj(E)
         e = e.unsqueeze(1).expand(-1, self.pred_len, -1)
         h, _ = self.lstm(e)
-        pos     = self.mlp_pos(h)
-        vel     = self.mlp_vel(h)
-        heading = self.mlp_heading(h)
-        return pos, vel, heading
+        pos = self.mlp_pos(h)   # [N, pred_len, 2]
+        return pos
 
 
 # ---------------------------------------------------------------------------
@@ -446,11 +384,14 @@ class LSTMDecoder(nn.Module):
 
 class DualSTMA(nn.Module):
     """
-    DualSTMA: Dual Spatial-Temporal Multi-head Attention
-    Huang et al., JMSE 2024
+    DualSTMA — Simplified (Επιλογή Α)
 
-    v3 changes:
-    - FIX #12: padding mask for surrounding vessels in spatial attention
+    ΑΛΛΑΓΕΣ από την αρχική υλοποίηση:
+    1. DynamicFeatureEncoder: in_channels=4 (LON, LAT, SOG, Heading)
+    2. forward() δεν δέχεται heading_rad / last_obs_pos
+    3. Δεν γίνεται inverse_rotate_translate — το μοντέλο βγάζει
+       απευθείας absolute normalized positions [0,1]
+    4. LSTMDecoder: μόνο mlp_pos (χωρίς mlp_vel, mlp_heading)
     """
 
     def __init__(self,
@@ -465,7 +406,8 @@ class DualSTMA(nn.Module):
         self.pred_len       = pred_len
         self.type_embed_dim = type_embed_dim
 
-        self.dynamic_encoder = DynamicFeatureEncoder(in_channels=8, d_model=d_model)
+        # ΑΛΛΑΓΗ: in_channels=4
+        self.dynamic_encoder = DynamicFeatureEncoder(in_channels=4, d_model=d_model)
         self.static_encoder  = StaticFeatureEncoder(
             num_vessel_types=num_vessel_types,
             num_lengths=num_lengths,
@@ -497,27 +439,26 @@ class DualSTMA(nn.Module):
         )
 
     def forward(self,
-                target_dynamic,          # [N, T, 8]
-                target_static,           # (type[N], width[N], length[N])
-                heading_rad,             # [N]
-                last_obs_pos,            # [N, 2]
-                surrounding_dynamic=None,  # [N, M, T, 8]
+                target_dynamic,            # [N, T, 4]  — LON, LAT, SOG, Heading
+                target_static,             # (type[N], width[N], length[N])
+                surrounding_dynamic=None,  # [N, M, T, 4]
                 surrounding_static=None,   # (type[N,M], width[N,M], length[N,M])
                 surr_mask=None):           # [N, M] bool — True=real, False=padded
         """
-        FIX #12: surr_mask passed to TS and ST paths for padding mask.
+        ΑΛΛΑΓΗ: heading_rad και last_obs_pos αφαιρέθηκαν.
+        Επιστρέφει απευθείας predicted positions σε normalized [0,1] space.
         """
         N = target_dynamic.shape[0]
 
         # Encode target
-        zd = self.dynamic_encoder(target_dynamic)
-        zd = self.feature_proj(zd)
+        zd = self.dynamic_encoder(target_dynamic)   # [N, T, d_model]
+        zd = self.feature_proj(zd)                  # [N, T, hidden_dim]
 
         v_type, v_width, v_length = target_static
         zs_gate, type_emb = self.static_encoder(v_type, v_width, v_length)
         zs_gate = self.gate_proj(zs_gate)
 
-        # Encode surrounding
+        # Encode surrounding vessels
         surr_zd   = None
         surr_gate = None
         surr_temb = None
@@ -544,22 +485,15 @@ class DualSTMA(nn.Module):
                 surr_gate = torch.ones(N, M, self.hidden_dim, device=zd.device)
                 surr_temb = torch.zeros(N, M, self.type_embed_dim, device=zd.device)
 
-        # Dual path encoding — FIX #12: pass surr_mask
+        # Dual path encoding
         TS = self.ts_path(zd, zs_gate, type_emb, surr_zd, surr_gate, surr_temb,
                           surr_mask=surr_mask)
         ST = self.st_path(zd, zs_gate, type_emb, surr_zd, surr_gate, surr_temb,
                           surr_mask=surr_mask)
 
         # Fuse and decode
-        E = torch.cat([TS, ST], dim=-1)
-        pos_vc, vel_vc, heading_vc = self.decoder(E)
+        E = torch.cat([TS, ST], dim=-1)             # [N, 2*hidden_dim]
+        pos = self.decoder(E)                        # [N, pred_len, 2]
 
-        # Inverse transform
-        head_expanded   = heading_rad.unsqueeze(1).expand(-1, self.pred_len)
-        origin_expanded = last_obs_pos.unsqueeze(1).expand(-1, self.pred_len, -1)
-
-        pos     = inverse_rotate_translate(pos_vc, head_expanded, origin_expanded)
-        vel     = rotate_vector(vel_vc, head_expanded)
-        heading = rotate_vector(heading_vc, head_expanded)
-
-        return pos, vel, heading
+        # ΑΛΛΑΓΗ: επιστρέφουμε απευθείας — χωρίς inverse_rotate_translate
+        return pos

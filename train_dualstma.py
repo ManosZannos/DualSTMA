@@ -1,24 +1,27 @@
 """
 train_dualstma.py
 
-Training script for DualSTMA v3 (Huang et al., JMSE 2024).
+Training script for DualSTMA — Simplified (Επιλογή Α)
+Huang et al., JMSE 2024
 
-v3 changes:
-  - surr_mask: boolean mask for real vs padded surrounding vessels
-  - Passed to model for key_padding_mask in spatial attention (Eq. 13, 18)
-  - Removed AMP (autocast/GradScaler) — paper uses float32 on RTX 3090Ti
+ΑΛΛΑΓΕΣ από v4:
+1. Dataset: 4 features [LON, LAT, SOG, Heading] αντί 8 vessel-centered
+   - Δεν γίνεται rotation/translation
+   - gt_pos: absolute normalized [0,1] positions (όπως METO-S2S)
+   - Αφαίρεση gt_vel, gt_heading, heading_rad, last_obs_pos
+2. Loss: μόνο position Huber (χωρίς vel/heading terms)
+3. Model forward: χωρίς heading_rad / last_obs_pos arguments
 
 Usage (RTX 4090):
-  python train_dualstma.py --dataset marinecadastre_2021 --obs_len 10 --pred_len 5
+  python train_dualstma.py --dataset marinecadastre_2021 --obs_len 10 --pred_len 5 --tag DualSTMA_simplified
 
 Usage (ihatz A100):
-  python train_dualstma.py --dataset marinecadastre_2021 --obs_len 10 --pred_len 5 --gpu_num 0
+  python train_dualstma.py --dataset marinecadastre_2021 --obs_len 10 --pred_len 5 --gpu_num 0 --tag DualSTMA_simplified
 """
 
 import os
 import sys
 import time
-import math
 import argparse
 import pickle
 import glob
@@ -29,10 +32,9 @@ import torch.nn as nn
 from torch import optim
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import functional as F
-import json
 import pandas as pd
 
-from model_dualstma import DualSTMA, rotate_translate
+from model_dualstma import DualSTMA
 
 # ---------------------------------------------------------------------------
 # Args
@@ -46,7 +48,7 @@ parser.add_argument('--pred_len',   type=int, default=5)
 parser.add_argument('--batch_size', type=int, default=256)
 parser.add_argument('--num_epochs', type=int, default=100)
 parser.add_argument('--lr',         type=float, default=0.0015)
-parser.add_argument('--tag',        default='DualSTMA_v4')
+parser.add_argument('--tag',        default='DualSTMA_simplified')
 parser.add_argument('--resume',     action='store_true', default=False)
 parser.add_argument('--max_surr',   type=int, default=10)
 
@@ -58,7 +60,7 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 args = parser.parse_args()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-print('Training DualSTMA v4 (normalized [0,1], post-norm) ...')
+print('Training DualSTMA Simplified (4 features, absolute positions, position-only loss) ...')
 print(args)
 
 
@@ -85,8 +87,14 @@ class Logger(object):
 
 class DualSTMADataset(Dataset):
     """
-    DualSTMA dataset with vessel-centered rotation transform.
-    v3: surr_mask — True=real vessel, False=padded zero
+    DualSTMA dataset — Simplified (Επιλογή Α)
+
+    ΑΛΛΑΓΕΣ:
+    - 4 features: [LON, LAT, SOG, Heading] normalized [0,1]
+    - Χωρίς vessel-centered rotation/translation
+    - gt_pos: absolute normalized [0,1] positions
+    - Χωρίς gt_vel, gt_heading, heading_rad, last_obs_pos
+    - surr_mask: True=real vessel, False=padded (διατηρείται)
     """
 
     def __init__(self, data_dir, obs_len=10, pred_len=5, max_surr=10):
@@ -123,50 +131,16 @@ class DualSTMADataset(Dataset):
                     samples.append((vessel_id, start))
         return samples
 
-    def _apply_rotation(self, lon, lat, heading_rad_tn):
-        cos_h = np.cos(-heading_rad_tn)
-        sin_h = np.sin(-heading_rad_tn)
-        lon_r =  cos_h * lon + sin_h * lat
-        lat_r = -sin_h * lon + cos_h * lat
-        return lon_r, lat_r
-
-    def _get_dynamic_features(self, rows, heading_rad_tn, origin_lon, origin_lat):
-        """8-channel dynamic features after vessel-centered rotation.
-        LON/LAT in normalized [0,1] space (METO-S2S min-max).
-        SOG and Heading normalized [0,1].
+    def _get_dynamic_features(self, rows):
+        """
+        4 features: [LON, LAT, SOG, Heading] — normalized [0,1]
+        Όπως METO-S2S — χωρίς vessel-centered transform.
         """
         lon     = rows['LON'].values.astype(np.float32)
         lat     = rows['LAT'].values.astype(np.float32)
         sog     = rows['SOG'].values.astype(np.float32)
         heading = rows['Heading'].values.astype(np.float32)
-
-        lon_t = lon - origin_lon
-        lat_t = lat - origin_lat
-        lon_r, lat_r = self._apply_rotation(lon_t, lat_t, heading_rad_tn)
-
-        dlon_r = np.zeros_like(lon_r)
-        dlat_r = np.zeros_like(lat_r)
-        dlon_r[1:] = lon_r[1:] - lon_r[:-1]
-        dlat_r[1:] = lat_r[1:] - lat_r[:-1]
-
-        heading_rad = heading * 2 * np.pi
-        v_lon_orig = sog * np.sin(heading_rad)
-        v_lat_orig = sog * np.cos(heading_rad)
-
-        cos_h = np.cos(-heading_rad_tn)
-        sin_h = np.sin(-heading_rad_tn)
-        v_lon_r =  cos_h * v_lon_orig + sin_h * v_lat_orig
-        v_lat_r = -sin_h * v_lon_orig + cos_h * v_lat_orig
-
-        theta_lon_orig = np.sin(heading_rad)
-        theta_lat_orig = np.cos(heading_rad)
-        theta_lon_r =  cos_h * theta_lon_orig + sin_h * theta_lat_orig
-        theta_lat_r = -sin_h * theta_lon_orig + cos_h * theta_lat_orig
-
-        return np.stack([
-            lon_r, lat_r, dlon_r, dlat_r,
-            v_lon_r, v_lat_r, theta_lon_r, theta_lat_r
-        ], axis=-1).astype(np.float32)
+        return np.stack([lon, lat, sog, heading], axis=-1)  # [T, 4]
 
     def __len__(self):
         return len(self.samples)
@@ -174,49 +148,34 @@ class DualSTMADataset(Dataset):
     def __getitem__(self, idx):
         vessel_id, start = self.samples[idx]
 
-        vessel_rows = self.df[self.df['vessel_id'] == vessel_id].sort_values('frame_id').reset_index(drop=True)
-        window      = vessel_rows.iloc[start:start + self.seq_len]
-        obs_rows    = window.iloc[:self.obs_len]
-        pred_rows   = window.iloc[self.obs_len:self.obs_len + self.pred_len]
+        vessel_rows = (self.df[self.df['vessel_id'] == vessel_id]
+                       .sort_values('frame_id')
+                       .reset_index(drop=True))
+        window   = vessel_rows.iloc[start:start + self.seq_len]
+        obs_rows = window.iloc[:self.obs_len]
+        pred_rows = window.iloc[self.obs_len:self.obs_len + self.pred_len]
 
         assert len(pred_rows) == self.pred_len
 
-        origin_lon     = float(obs_rows['LON'].iloc[-1])
-        origin_lat     = float(obs_rows['LAT'].iloc[-1])
-        heading_norm   = float(obs_rows['Heading'].iloc[-1])
-        heading_rad_tn = heading_norm * 2 * np.pi
+        # --- Target vessel dynamic features (observation window) ---
+        obs_features = self._get_dynamic_features(obs_rows)  # [obs_len, 4]
 
-        all_features = self._get_dynamic_features(
-            window, heading_rad_tn, origin_lon, origin_lat
-        )
-        obs_features = all_features[:self.obs_len]
-
+        # --- Static features ---
         v_type   = int(obs_rows['vessel_type'].iloc[0])
         v_width  = int(obs_rows['vessel_width'].iloc[0])
         v_length = int(obs_rows['vessel_length'].iloc[0])
 
+        # --- Ground truth: absolute normalized positions [0,1] ---
         gt_lon = pred_rows['LON'].values.astype(np.float32)
         gt_lat = pred_rows['LAT'].values.astype(np.float32)
-        gt_pos = np.stack([gt_lon, gt_lat], axis=-1)
+        gt_pos = np.stack([gt_lon, gt_lat], axis=-1)  # [pred_len, 2]
 
-        pred_sog          = pred_rows['SOG'].values.astype(np.float32)
-        pred_heading_norm = pred_rows['Heading'].values.astype(np.float32)
-        pred_heading_rad  = pred_heading_norm * 2 * np.pi
-
-        v_lon_orig = pred_sog * np.sin(pred_heading_rad)
-        v_lat_orig = pred_sog * np.cos(pred_heading_rad)
-        gt_vel = np.stack([v_lon_orig, v_lat_orig], axis=-1)
-
-        theta_lon_orig = np.sin(pred_heading_rad)
-        theta_lat_orig = np.cos(pred_heading_rad)
-        gt_heading = np.stack([theta_lon_orig, theta_lat_orig], axis=-1)
-
-        # Surrounding vessels
+        # --- Surrounding vessels ---
         obs_frame_ids   = obs_rows['frame_id'].values
         frame_start_obs = obs_frame_ids[0]
         frame_end_obs   = obs_frame_ids[-1]
 
-        surr_df      = self.df[
+        surr_df = self.df[
             (self.df['vessel_id'] != vessel_id) &
             (self.df['frame_id'] >= frame_start_obs) &
             (self.df['frame_id'] <= frame_end_obs)
@@ -233,17 +192,15 @@ class DualSTMADataset(Dataset):
             sv_window = sv_rows[sv_rows['frame_id'].isin(obs_frame_ids)].sort_values('frame_id')
             if len(sv_window) != self.obs_len:
                 continue
-            sv_feat = self._get_dynamic_features(
-                sv_window, heading_rad_tn, origin_lon, origin_lat
-            )
+            # Surrounding vessels: ίδια 4 features, χωρίς rotation
+            sv_feat = self._get_dynamic_features(sv_window)  # [obs_len, 4]
             surr_features_list.append(sv_feat)
             surr_types.append(int(sv_window['vessel_type'].iloc[0]))
             surr_widths.append(int(sv_window['vessel_width'].iloc[0]))
             surr_lengths.append(int(sv_window['vessel_length'].iloc[0]))
 
-        n_real = len(surr_features_list)
-
-        surr_dynamic = np.zeros((self.max_surr, self.obs_len, 8), dtype=np.float32)
+        # Padding
+        surr_dynamic = np.zeros((self.max_surr, self.obs_len, 4), dtype=np.float32)
         s_types      = np.zeros(self.max_surr, dtype=np.int64)
         s_widths     = np.zeros(self.max_surr, dtype=np.int64)
         s_lengths    = np.zeros(self.max_surr, dtype=np.int64)
@@ -257,20 +214,16 @@ class DualSTMADataset(Dataset):
             surr_mask[i]    = True
 
         return {
-            'obs_features':  torch.tensor(obs_features,  dtype=torch.float32),
-            'gt_pos':        torch.tensor(gt_pos,         dtype=torch.float32),
-            'gt_vel':        torch.tensor(gt_vel,         dtype=torch.float32),
-            'gt_heading':    torch.tensor(gt_heading,     dtype=torch.float32),
-            'last_obs_pos':  torch.tensor([origin_lon, origin_lat], dtype=torch.float32),
-            'heading_rad':   torch.tensor(heading_rad_tn, dtype=torch.float32),
-            'v_type':        torch.tensor(v_type,   dtype=torch.long),
-            'v_width':       torch.tensor(v_width,  dtype=torch.long),
-            'v_length':      torch.tensor(v_length, dtype=torch.long),
-            'surr_dynamic':  torch.tensor(surr_dynamic, dtype=torch.float32),
-            's_types':       torch.tensor(s_types,   dtype=torch.long),
-            's_widths':      torch.tensor(s_widths,  dtype=torch.long),
-            's_lengths':     torch.tensor(s_lengths, dtype=torch.long),
-            'surr_mask':     torch.tensor(surr_mask, dtype=torch.bool),
+            'obs_features': torch.tensor(obs_features,  dtype=torch.float32),
+            'gt_pos':       torch.tensor(gt_pos,         dtype=torch.float32),
+            'v_type':       torch.tensor(v_type,   dtype=torch.long),
+            'v_width':      torch.tensor(v_width,  dtype=torch.long),
+            'v_length':     torch.tensor(v_length, dtype=torch.long),
+            'surr_dynamic': torch.tensor(surr_dynamic, dtype=torch.float32),
+            's_types':      torch.tensor(s_types,   dtype=torch.long),
+            's_widths':     torch.tensor(s_widths,  dtype=torch.long),
+            's_lengths':    torch.tensor(s_lengths, dtype=torch.long),
+            'surr_mask':    torch.tensor(surr_mask, dtype=torch.bool),
         }
 
 
@@ -278,18 +231,17 @@ class DualSTMADataset(Dataset):
 # Loss
 # ---------------------------------------------------------------------------
 
-def wrapped_heading_error_floormod(pred_h, gt_h):
-    """FIX #11: Wrapped heading error with floormod (Eq. 38)."""
-    diff = pred_h - gt_h
-    return -math.pi + torch.fmod(diff + math.pi, 2 * math.pi)
+def dualstma_loss(pred_pos, gt_pos, lambda_pos=10.0):
+    """
+    Position-only Huber loss με time-decay weights.
+    ΑΛΛΑΓΗ: αφαίρεση vel_loss και heading_loss.
 
-
-def dualstma_loss(pred_pos, pred_vel, pred_heading,
-                  gt_pos, gt_vel, gt_heading,
-                  lambda_pos=10.0, lambda_heading=1.0, lambda_vel=0.1):
-    """DualSTMA loss (Eq. 36-41). All in original coordinate space."""
+    pred_pos: [N, pred_len, 2] — normalized [0,1]
+    gt_pos:   [N, pred_len, 2] — normalized [0,1]
+    """
     pred_len = pred_pos.shape[1]
 
+    # Time-decay weights: πρώτα timesteps πιο σημαντικά
     weights = torch.tensor(
         [(pred_len - t) for t in range(pred_len)],
         dtype=torch.float32, device=pred_pos.device
@@ -300,12 +252,9 @@ def dualstma_loss(pred_pos, pred_vel, pred_heading,
         weights[t] * F.huber_loss(pred_pos[:, t], gt_pos[:, t])
         for t in range(pred_len)
     )
-    vel_loss     = F.huber_loss(pred_vel, gt_vel)
-    h_error      = wrapped_heading_error_floormod(pred_heading, gt_heading)
-    heading_loss = F.huber_loss(h_error, torch.zeros_like(h_error))
 
-    total = lambda_pos * pos_loss + lambda_heading * heading_loss + lambda_vel * vel_loss
-    return total, pos_loss, vel_loss, heading_loss
+    total = lambda_pos * pos_loss
+    return total, pos_loss
 
 
 # ---------------------------------------------------------------------------
@@ -323,24 +272,21 @@ def run_epoch(model, loader, optimizer, checkpoint_dir, epoch, train=True):
     global metrics, constant_metrics
     model.train() if train else model.eval()
 
-    total_loss = 0.0
-    n_batches  = 0
+    total_loss     = 0.0
+    total_pos_loss = 0.0
+    n_batches      = 0
     ctx = torch.enable_grad() if train else torch.no_grad()
 
     with ctx:
         for batch in loader:
-            obs        = batch['obs_features'].to(device)
-            gt_pos     = batch['gt_pos'].to(device)
-            gt_vel     = batch['gt_vel'].to(device)
-            gt_heading = batch['gt_heading'].to(device)
-            last_obs   = batch['last_obs_pos'].to(device)
-            head_rad   = batch['heading_rad'].to(device)
+            obs        = batch['obs_features'].to(device)   # [N, obs_len, 4]
+            gt_pos     = batch['gt_pos'].to(device)          # [N, pred_len, 2]
 
             v_type   = batch['v_type'].to(device)
             v_width  = batch['v_width'].to(device)
             v_length = batch['v_length'].to(device)
 
-            surr_dyn  = batch['surr_dynamic'].to(device)
+            surr_dyn  = batch['surr_dynamic'].to(device)    # [N, max_surr, obs_len, 4]
             s_types   = batch['s_types'].to(device)
             s_widths  = batch['s_widths'].to(device)
             s_lengths = batch['s_lengths'].to(device)
@@ -349,18 +295,14 @@ def run_epoch(model, loader, optimizer, checkpoint_dir, epoch, train=True):
             target_static      = (v_type, v_width, v_length)
             surrounding_static = (s_types, s_widths, s_lengths)
 
-            # Forward pass — float32, no AMP
-            pred_pos, pred_vel, pred_heading = model(
+            # Forward — χωρίς heading_rad / last_obs_pos
+            pred_pos = model(
                 obs, target_static,
-                head_rad, last_obs,
                 surr_dyn, surrounding_static,
                 surr_mask=surr_mask
             )
 
-            loss, pos_l, vel_l, head_l = dualstma_loss(
-                pred_pos, pred_vel, pred_heading,
-                gt_pos, gt_vel, gt_heading
-            )
+            loss, pos_l = dualstma_loss(pred_pos, gt_pos)
 
             if train:
                 optimizer.zero_grad()
@@ -368,30 +310,28 @@ def run_epoch(model, loader, optimizer, checkpoint_dir, epoch, train=True):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
-            # Check for NaN
             if torch.isnan(loss):
                 print(f'  WARNING: NaN loss at batch {n_batches}!')
-                print(f'    pos_l={pos_l.item():.6f} vel_l={vel_l.item():.6f} head_l={head_l.item():.6f}')
                 continue
 
-            total_loss += loss.item()
-            n_batches  += 1
+            total_loss     += loss.item()
+            total_pos_loss += pos_l.item()
+            n_batches      += 1
 
             if train and n_batches % 100 == 0:
                 print(f'  Epoch {epoch} | Batch {n_batches} | '
                       f'Loss {total_loss/n_batches:.6f} | '
-                      f'Pos {pos_l.item():.6f} | '
-                      f'Vel {vel_l.item():.6f} | '
-                      f'Head {head_l.item():.6f}')
+                      f'Pos {total_pos_loss/n_batches:.6f}')
 
-            del obs, gt_pos, gt_vel, gt_heading, pred_pos, pred_vel, pred_heading
+            del obs, gt_pos, pred_pos
             torch.cuda.empty_cache()
 
-    avg = total_loss / max(1, n_batches)
+    avg     = total_loss / max(1, n_batches)
+    avg_pos = total_pos_loss / max(1, n_batches)
 
     if train:
         metrics['train_loss'].append(avg)
-        print(f'TRAIN Epoch {epoch}: loss={avg:.6f}')
+        print(f'TRAIN Epoch {epoch}: loss={avg:.6f} | pos_loss={avg_pos:.6f}')
         if avg < constant_metrics['min_train_loss']:
             constant_metrics['min_train_loss']  = avg
             constant_metrics['min_train_epoch'] = epoch
@@ -401,7 +341,7 @@ def run_epoch(model, loader, optimizer, checkpoint_dir, epoch, train=True):
             f.write(str(epoch))
     else:
         metrics['val_loss'].append(avg)
-        print(f'VALD  Epoch {epoch}: loss={avg:.6f}')
+        print(f'VALD  Epoch {epoch}: loss={avg:.6f} | pos_loss={avg_pos:.6f}')
         if avg < constant_metrics['min_val_loss']:
             constant_metrics['min_val_loss']  = avg
             constant_metrics['min_val_epoch'] = epoch
@@ -493,7 +433,7 @@ def main():
 if __name__ == '__main__':
     log_path = './Logs_train/'
     os.makedirs(log_path, exist_ok=True)
-    log_file = log_path + 'dualstma_v3-' + time.strftime('%Y%m%d-%H%M%S') + '.log'
+    log_file = log_path + 'dualstma_simplified-' + time.strftime('%Y%m%d-%H%M%S') + '.log'
     sys.stdout = Logger(log_file)
     sys.stderr = Logger(log_file)
 
